@@ -12,18 +12,90 @@ function alfredMatcher(str) {
 }
 
 /**
- * @param {string} url
- * @param {string[]} header
- * @return {string} response
+ * @param {string[]} headers
+ * @return {string} formatted curl header arguments
  */
-function httpRequestWithHeaders(url, header) {
-	let allHeaders = "";
-	for (const line of header) {
-		allHeaders += ` -H "${line}"`;
-	}
-	const curlRequest = `curl --silent --location ${allHeaders} "${url}" || true`;
+function formatCurlHeaders(headers) {
+	return headers.map((h) => `-H "${h}"`).join(" ");
+}
+
+/**
+ * @param {string} url
+ * @param {string[]} headers
+ * @return {string} response body
+ */
+function httpRequestWithHeaders(url, headers) {
+	const curlRequest = `curl --silent --location ${formatCurlHeaders(headers)} "${url}" || true`;
 	console.log(curlRequest);
 	return app.doShellScript(curlRequest);
+}
+
+/**
+ * @param {string} url
+ * @param {string[]} headers
+ * @return {{body: string, lastPage: number|null}} response body and last page number from Link header
+ */
+function httpRequestWithHeadersAndLinkHeader(url, headers) {
+	const curlRequest = `curl --silent --location --include ${formatCurlHeaders(headers)} "${url}" || true`;
+	console.log(curlRequest);
+	const fullResponse = app.doShellScript(curlRequest);
+
+	// Split headers from body (HTTP headers end with double CRLF or double LF)
+	// JXA converts \r\n to \r, so we split on \r\r
+	const parts = fullResponse.split("\r\r");
+	const headerSection = parts[0] || "";
+	const body = parts.slice(1).join("\r\r");
+
+	// Parse Link header for last page
+	let lastPage = null;
+	const linkMatch = headerSection.match(/link:\s*(.+)/i);
+	if (linkMatch) {
+		const linkHeader = linkMatch[1];
+		// Look for rel="last" and extract page number
+		const lastMatch = linkHeader.match(/<[^>]*[?&]page=(\d+)[^>]*>;\s*rel="last"/);
+		if (lastMatch) {
+			lastPage = Number.parseInt(lastMatch[1], 10);
+		}
+	}
+
+	return { body, lastPage };
+}
+
+/**
+ * Fetch multiple URLs in parallel using background curl processes
+ * @param {string[]} urls
+ * @param {string[]} headers
+ * @return {string[]} array of response bodies in same order as urls
+ */
+function httpRequestsInParallel(urls, headers) {
+	if (urls.length === 0) return [];
+
+	const headerArgs = formatCurlHeaders(headers);
+	const tmpDir = app.doShellScript("mktemp -d");
+
+	// Build parallel curl commands that write to numbered files
+	const curlCommands = urls
+		.map((url, i) => `curl --silent --location ${headerArgs} "${url}" > "${tmpDir}/${i}.json" &`)
+		.join("\n");
+
+	// Run all curls in parallel and wait for completion
+	const script = `${curlCommands}\nwait`;
+	console.log(`Fetching ${urls.length} pages in parallel...`);
+	app.doShellScript(script);
+
+	// Read results in order
+	const results = urls.map((_, i) => {
+		try {
+			return app.doShellScript(`cat "${tmpDir}/${i}.json"`);
+		} catch (_e) {
+			return "[]";
+		}
+	});
+
+	// Cleanup
+	app.doShellScript(`rm -rf "${tmpDir}"`);
+
+	return results;
 }
 
 /** @param {number} starcount */
@@ -92,30 +164,53 @@ function run() {
 		headers.push(`Authorization: BEARER ${githubToken}`);
 	}
 
-	// Paginate through all repos
+	// Fetch first page and determine total pages from Link header
 	/** @type {GithubRepo[]} */
 	const allRepos = [];
-	let page = 1;
-	while (true) {
-		const response = httpRequestWithHeaders(apiUrl + `&page=${page}`, headers);
-		if (!response) {
-			const item = { title: "No response from GitHub. Try again later.", valid: false };
-			return JSON.stringify({ items: [item] });
+	const firstPageUrl = apiUrl + "&page=1";
+	const { body: firstResponse, lastPage } = httpRequestWithHeadersAndLinkHeader(
+		firstPageUrl,
+		headers,
+	);
+
+	if (!firstResponse) {
+		const item = { title: "No response from GitHub. Try again later.", valid: false };
+		return JSON.stringify({ items: [item] });
+	}
+	const firstPageRepos = JSON.parse(firstResponse);
+	if (firstPageRepos.message) {
+		const item = {
+			title: "GitHub denied request.",
+			subtitle: firstPageRepos.message,
+			valid: false,
+		};
+		return JSON.stringify({ items: [item] });
+	}
+	console.log(`repos page #1: ${firstPageRepos.length}`);
+	allRepos.push(...firstPageRepos);
+
+	// Fetch remaining pages in parallel if there are more
+	if (!only100repos && lastPage && lastPage > 1) {
+		const remainingUrls = [];
+		for (let page = 2; page <= lastPage; page++) {
+			remainingUrls.push(apiUrl + `&page=${page}`);
 		}
-		const reposOfPage = JSON.parse(response);
-		if (reposOfPage.message) {
-			const item = {
-				title: "GitHub denied request.",
-				subtitle: reposOfPage.message,
-				valid: false,
-			};
-			return JSON.stringify({ items: [item] });
+
+		const responses = httpRequestsInParallel(remainingUrls, headers);
+		for (let i = 0; i < responses.length; i++) {
+			const response = responses[i];
+			if (response) {
+				try {
+					const repos = JSON.parse(response);
+					if (!repos.message) {
+						console.log(`repos page #${i + 2}: ${repos.length}`);
+						allRepos.push(...repos);
+					}
+				} catch (_e) {
+					// Skip invalid JSON responses
+				}
+			}
 		}
-		console.log(`repos page #${page}: ${reposOfPage.length}`);
-		allRepos.push(...reposOfPage);
-		page++;
-		if (only100repos) break; // PERF only one request when user enabled this
-		if (reposOfPage.length < 100) break; // GitHub returns less than 100 when on last page
 	}
 
 	// Create items for Alfred
